@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+
+<plugin
+   name="Aardwolf_GQuest_Miniwindow"
+   author="Dunnaakr"
+   id="a1965272c8ca966b76f36fa5"
+   language="Lua"
+   purpose="Shows a miniwindow with Global Quest level-range text + clickable Join text"
+   date_written="2026-04-09"
+   requires="5.07"
+   version="1.1"
+   save_state="y"
+>
+</plugin>
+
+<triggers>
+  <!-- ONLY new Global Quests (ignores wins and other messages) -->
+  <trigger
+     match="^Global Quest: Global quest # \d+ has been declared for levels"
+     enabled="y"
+     regexp="y"
+     sequence="100"
+     ignore_case="y"
+     script="process_gquest"
+  >
+  </trigger>
+</triggers>
+
+<script>
+<![CDATA[
+require "themed_miniwindows"
+
+my_window = nil
+local current_quest_num = nil
+
+function process_gquest(trigger_name, line, wildcards, styles)
+   -- Extract the quest number after the #
+   current_quest_num = string.match(line, "#%s*(%d+)") or ""
+
+   if not my_window or not my_window.id then
+      my_window = ThemedTextWindow(
+         GetPluginID() .. "_gquest",
+         200, 200, 650, 340,
+         "Global Quest Alert",
+         "center",
+         true,      -- temporary (adds X close button)
+         true,      -- resizeable
+         false,     -- text_scrollable
+         false,     -- text_selectable
+         false,     -- text_copyable
+         false,     -- url_hyperlinks
+         true,      -- autowrap
+         nil, nil,
+         GetAlphaOption("output_font_name"),
+         GetOption("output_font_height"),
+         50, 8, false, false
+      )
+   else
+      my_window:clear(false)
+   end
+
+   -- Add the original colored Global Quest announcement line
+   my_window:add_text(styles, false)
+
+   -- Add a blank line
+   my_window:add_text("@W", false)
+
+   -- Add the clickable "Join Global Quest" text
+   if current_quest_num and current_quest_num ~= "" then
+      local join_cmd = "gquest join " .. current_quest_num
+      
+      my_window:add_text(
+         "@WClick here to join: ", 
+         false
+      )
+      
+      -- Add clickable hyperlink-style text (using the same mechanism as other themed windows / market plugin style)
+      my_window:add_text(
+         "@GJoin Global Quest #" .. current_quest_num,
+         false,
+         {
+            {
+               start = 1,
+               stop = #("Join Global Quest #" .. current_quest_num),
+               text = 'Execute("' .. join_cmd .. '")',
+               label = "Join Global Quest #" .. current_quest_num
+            }
+         }
+      )
+   else
+      -- Fallback if number couldn't be parsed
+      my_window:add_text(
+         "@WClick here to join the Global Quest", 
+         false,
+         {
+            {
+               start = 1,
+               stop = #"Click here to join the Global Quest",
+               text = 'Execute("gquest join")',
+               label = "Join Global Quest"
+            }
+         }
+      )
+   end
+
+   my_window:draw()
+   my_window:show()
+   my_window:bring_to_front()
+
+   -- Repaint calls (kept from your original for compatibility with themed_miniwindows / other plugins)
+   CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+   CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+
+   DoAfterSpecial(0, [[
+      CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+      CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+   ]], 12)
+
+   ColourNote("paleturquoise", "", "Global Quest captured to miniwindow with clickable join link!")
+end
+
+function OnPluginDisable()
+   if my_window and my_window.id then
+      my_window:delete()
+      my_window = nil
+   end
+end
+
+]]>
+</script>
+</muclient>
