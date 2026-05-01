@@ -1,0 +1,572 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+
+<plugin
+   name="Aardwolf_Marketplace_Miniwindow"
+   author="Dunnaakr"
+   id="b7d7f1e4a93c42b79e6f1052"
+   language="Lua"
+   purpose="Captures Aardwolf marketplace output into themed miniwindows with clickable actions."
+   date_written="2026-04-28"
+   requires="5.07"
+   version="0.1"
+   save_state="y"
+>
+<description trim="y">
+<![CDATA[
+Aardwolf marketplace miniwindow.
+
+Commands intercepted:
+  lbid
+  market list
+  lbid <num>
+  market bid <num>
+
+Behavior:
+  - Captures market listings into a resizable themed miniwindow
+  - Clicking the item number opens a detail miniwindow
+  - Clicking the last bid sends the next bid tier automatically
+
+Current assumptions in this first draft:
+  - Gold bid increment uses previous bid + max(500, min(5%, 50000))
+  - Only QP/TP bids append 'confirm'
+  - A trailing * on Last Bid means you are already the current high bidder
+]]>
+</description>
+</plugin>
+
+<aliases>
+<alias
+   match="^lbid$"
+   enabled="y"
+   regexp="y"
+   sequence="100"
+   ignore_case="y"
+   send_to="12"
+>
+<send>
+market_capture_list("%0")
+</send>
+</alias>
+
+<alias
+   match="^market +list$"
+   enabled="y"
+   regexp="y"
+   sequence="100"
+   ignore_case="y"
+   send_to="12"
+>
+<send>
+market_capture_list("%0")
+</send>
+</alias>
+
+<alias
+   match="^lbid +(\d+)$"
+   enabled="y"
+   regexp="y"
+   sequence="100"
+   ignore_case="y"
+   send_to="12"
+>
+<send>
+market_capture_detail("%1")
+</send>
+</alias>
+
+<alias
+   match="^market +bid +(\d+)$"
+   enabled="y"
+   regexp="y"
+   sequence="100"
+   ignore_case="y"
+   send_to="12"
+>
+<send>
+market_capture_detail("%1")
+</send>
+</alias>
+
+<alias
+   match="^marketwin +(refresh|reload)$"
+   enabled="y"
+   regexp="y"
+   sequence="100"
+   ignore_case="y"
+   send_to="12"
+>
+<send>
+market_refresh()
+</send>
+</alias>
+
+<alias
+   match="^mybids$"
+   enabled="y"
+   regexp="y"
+   sequence="100"
+   ignore_case="y"
+   send_to="12"
+>
+<send>
+market_show_mybids()
+</send>
+</alias>
+</aliases>
+
+<script>
+<![CDATA[
+require "wrapped_captures"
+require "themed_miniwindows"
+
+market_plugin = {
+   list_window = nil,
+   detail_window = nil,
+   last_list_command = "lbid",
+   current_detail_num = nil,
+   rows_by_num = {},
+   pending_after_list = nil,
+   list_title = "Aardwolf Marketplace",
+   detail_title = "Marketplace Item",
+   list_start_pattern = "^\\s*\\[ Aardwolf Marketplace - Current List of Inventory \\]\\s*$",
+   list_end_pattern = "^Type: 'Lbid <num>' to see stats and 'Lbid <num> <amount>' to bid on an item\\.$",
+   detail_start_pattern = "^\\+[-]+\\+$",
+   detail_end_pattern = "^\\| Current bid\\s+:\\s+.*\\|$",
+   min_increment = 500,
+   max_increment = 50000,
+   percent_increment = 0.05,
+}
+
+local function trim(value)
+   return (value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function line_text(styles)
+   return trim(strip_colours_from_styles(styles or {}))
+end
+
+local function ensure_capture_available()
+   if Capture and Capture.command then
+      return true
+   end
+   ColourNote("white", "red", "Marketplace window needs Capture.command, but it is not available in this session.")
+   return false
+end
+
+local function clean_amount(amount_text)
+   local cleaned = ((amount_text or ""):gsub("[,%*]", ""))
+   return tonumber(cleaned)
+end
+
+local function format_amount(amount)
+   local reversed = tostring(math.floor(amount or 0)):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+   return reversed:gsub("^,", "")
+end
+
+local function requires_confirm(listing_type, last_bid_text)
+   local typed = (listing_type or ""):upper()
+   return typed:find("QP", 1, true) ~= nil
+      or typed:find("TP", 1, true) ~= nil
+end
+
+function market_next_bid_amount(last_bid_text, listing_type)
+   local current = clean_amount(last_bid_text) or 0
+   if current < 1 then
+      current = 1
+   end
+
+   -- First draft assumption: gold-style tiering uses at least 500,
+   -- but caps the 5% step at 50,000.
+   local increment = math.ceil(current * market_plugin.percent_increment)
+   increment = math.min(increment, market_plugin.max_increment)
+   increment = math.max(increment, market_plugin.min_increment)
+
+   -- Non-gold listings are still treated with the same tier rule for now
+   -- until we verify a different QP/TP rule from live output/help.
+   if listing_type and listing_type:upper():find("GOLD", 1, true) == nil then
+      increment = math.max(1, increment)
+   end
+
+   return current + increment
+end
+
+local function parse_market_row(raw_line)
+   local num, description, level, listing_type, last_bid, bids, time_left =
+      raw_line:match("^%s*(%d+)%s+(.-)%s+(%d+)%s+([*%a]+)%s+([%d,]+%*?)%s+(%d+)%s+(.+)$")
+
+   if not num then
+      return nil
+   end
+
+   return {
+      num = num,
+      description = description,
+      level = level,
+      listing_type = listing_type,
+      last_bid = last_bid,
+      bids = bids,
+      time_left = time_left,
+   }
+end
+
+local function build_row_hyperlinks(raw_line, row)
+   local links = {}
+
+   local num_start, num_end = raw_line:find(row.num, 1, true)
+   if num_start and num_end then
+      table.insert(
+         links,
+         {
+            start = num_start,
+            stop = num_end,
+            text = string.format('market_capture_detail(%q)', row.num),
+            label = "Open market item " .. row.num,
+         }
+      )
+   end
+
+   local prefix, last_bid = raw_line:match("^(.-)([%d,]+%*?)%s+%d+%s+[%dd:%s]+$")
+   if prefix and last_bid then
+      if last_bid:sub(-1) == "*" then
+         return links
+      end
+
+      local bid_start = #prefix + 1
+      local bid_stop = bid_start + #last_bid - 1
+      local next_bid = market_next_bid_amount(last_bid, row.listing_type)
+      local command = string.format(
+         "lbid %s %s%s",
+         row.num,
+         tostring(next_bid),
+         requires_confirm(row.listing_type, last_bid) and " confirm" or ""
+      )
+
+      table.insert(
+         links,
+         {
+            start = bid_start,
+            stop = bid_stop,
+            text = string.format('market_send_bid(%q, %q, %q)', row.num, last_bid, row.listing_type),
+            label = "Bid " .. format_amount(next_bid) .. " on item " .. row.num .. " (" .. command .. ")",
+         }
+      )
+   end
+
+   return links
+end
+
+local function add_refresh_menu(window, handler)
+   table.insert(window.menu_table, "-")
+   table.insert(window.menu_table, "Refresh")
+   table.insert(window.menu_handlers, handler)
+end
+
+local function sorted_market_rows()
+   local rows = {}
+   for _, row in pairs(market_plugin.rows_by_num or {}) do
+      table.insert(rows, row)
+   end
+
+   table.sort(
+      rows,
+      function(a, b)
+         return tonumber(a.num) < tonumber(b.num)
+      end
+   )
+
+   return rows
+end
+
+local function report_mybids()
+   local winning_rows = {}
+   for _, row in ipairs(sorted_market_rows()) do
+      if (row.last_bid or ""):sub(-1) == "*" then
+         table.insert(winning_rows, row)
+      end
+   end
+
+   if #winning_rows == 0 then
+      ColourNote("paleturquoise", "", "You are not currently the highest bidder on any cached market items.")
+      return
+   end
+
+   ColourNote("lightgreen", "", string.format("Current winning market bids: %d", #winning_rows))
+   for _, row in ipairs(winning_rows) do
+      local clean_bid = format_amount(clean_amount(row.last_bid) or 0)
+      local summary = string.format(
+         "#%s  %s  [%s]  bid %s  bids %s  time %s",
+         row.num,
+         row.description,
+         row.listing_type,
+         clean_bid,
+         row.bids,
+         row.time_left
+      )
+      Hyperlink(
+         "lbid " .. row.num,
+         summary,
+         "Open market item " .. row.num,
+         "lightblue",
+         "",
+         false
+      )
+   end
+end
+
+local function ensure_list_window()
+   if market_plugin.list_window and market_plugin.list_window.id then
+      market_plugin.list_window:clear(false)
+      return market_plugin.list_window
+   end
+
+   local win = ThemedTextWindow(
+      GetPluginID() .. "_market_list",
+      100,
+      80,
+      900,
+      650,
+      market_plugin.list_title,
+      "center",
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      nil,
+      nil,
+      GetAlphaOption("output_font_name"),
+      GetOption("output_font_height"),
+      5000,
+      6,
+      true
+   )
+
+   add_refresh_menu(
+      win,
+      function()
+         market_capture_list(market_plugin.last_list_command or "lbid")
+      end
+   )
+
+   market_plugin.list_window = win
+   return win
+end
+
+local function ensure_detail_window(item_num)
+   if market_plugin.detail_window and market_plugin.detail_window.id then
+      market_plugin.detail_window:clear(false)
+      market_plugin.detail_window:dress_window(market_plugin.detail_title .. " #" .. item_num)
+      return market_plugin.detail_window
+   end
+
+   local win = ThemedTextWindow(
+      GetPluginID() .. "_market_detail",
+      160,
+      120,
+      760,
+      520,
+      market_plugin.detail_title .. " #" .. item_num,
+      "center",
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      nil,
+      nil,
+      GetAlphaOption("output_font_name"),
+      GetOption("output_font_height"),
+      3000,
+      6,
+      true
+   )
+
+   add_refresh_menu(
+      win,
+      function()
+         if market_plugin.current_detail_num then
+            market_capture_detail(market_plugin.current_detail_num)
+         end
+      end
+   )
+
+   table.insert(win.menu_table, "Bid Next Tier")
+   table.insert(
+      win.menu_handlers,
+      function()
+         local row = market_plugin.rows_by_num[market_plugin.current_detail_num or ""]
+         if row then
+            if row.last_bid:sub(-1) == "*" then
+               ColourNote("paleturquoise", "", "You are already the current high bidder on this item.")
+            else
+               market_send_bid(row.num, row.last_bid, row.listing_type)
+            end
+         else
+            ColourNote("white", "red", "No cached list row for this item yet. Refresh the list first.")
+         end
+      end
+   )
+
+   market_plugin.detail_window = win
+   return win
+end
+
+function process_market_list(window_styles, start_line, end_line)
+   market_plugin.rows_by_num = {}
+
+   local win = ensure_list_window()
+   local intro_added = false
+
+   for _, styles in ipairs(window_styles or {}) do
+      local raw = strip_colours_from_styles(styles or {})
+      local trimmed = trim(raw)
+      local row = parse_market_row(raw)
+
+      if row then
+         market_plugin.rows_by_num[row.num] = row
+         win:add_text(styles, false, build_row_hyperlinks(raw, row))
+      elseif trimmed ~= "" then
+         if not intro_added and trimmed == "Num    Item Description             Lvl  Type Last Bid         Bids Time Left" then
+            win:add_text("@WClick an item number for details. Click a last bid value to bid the next tier.", false)
+            intro_added = true
+         end
+         win:add_text(styles, false)
+      end
+   end
+
+   win:fit_contents(GetInfo(281) - 30, GetInfo(280) - 80)
+   win:set_scroll(1)
+   win:show()
+   win:bring_to_front()
+
+   if market_plugin.pending_after_list then
+      local callback = market_plugin.pending_after_list
+      market_plugin.pending_after_list = nil
+      callback()
+   end
+end
+
+function process_market_detail(window_styles, start_line, end_line)
+   local item_num = market_plugin.current_detail_num or "?"
+   local win = ensure_detail_window(item_num)
+
+   for _, styles in ipairs(window_styles or {}) do
+      local trimmed = line_text(styles)
+      if trimmed ~= "" then
+         win:add_text(styles, false)
+      end
+   end
+
+    win:add_text("@W", false)
+    local row = market_plugin.rows_by_num[item_num]
+    if row then
+       if row.last_bid:sub(-1) == "*" then
+          win:add_text("@GYou are already the current high bidder on this item.", false)
+       else
+          local next_bid = market_next_bid_amount(row.last_bid, row.listing_type)
+          win:add_text(
+             string.format("@WNext bid tier from cached market list: @G%s", format_amount(next_bid)),
+             false
+          )
+       end
+    end
+
+   win:fit_contents(GetInfo(281) - 50, GetInfo(280) - 90)
+   win:set_scroll(1)
+   win:show()
+   win:bring_to_front()
+end
+
+function market_capture_list(command)
+   if not ensure_capture_available() then
+      return
+   end
+
+   market_plugin.last_list_command = command or "lbid"
+   Capture.command(
+      market_plugin.last_list_command,
+      market_plugin.list_start_pattern,
+      market_plugin.list_end_pattern,
+      true,
+      false,
+      true,
+      false,
+      process_market_list
+   )
+end
+
+function market_capture_detail(item_num)
+   if not ensure_capture_available() then
+      return
+   end
+
+   market_plugin.current_detail_num = tostring(item_num)
+   Capture.command(
+      "lbid " .. tostring(item_num),
+      market_plugin.detail_start_pattern,
+      market_plugin.detail_end_pattern,
+      true,
+      false,
+      true,
+      false,
+      process_market_detail
+   )
+end
+
+function market_send_bid(item_num, last_bid_text, listing_type)
+   if (last_bid_text or ""):sub(-1) == "*" then
+      ColourNote("paleturquoise", "", "You are already the current high bidder on this item.")
+      return
+   end
+
+   local next_bid = market_next_bid_amount(last_bid_text, listing_type)
+   local command = string.format(
+      "lbid %s %s%s",
+      tostring(item_num),
+      tostring(next_bid),
+      requires_confirm(listing_type, last_bid_text) and " confirm" or ""
+   )
+
+   Execute(command)
+   ColourNote(
+      "paleturquoise",
+      "",
+      string.format("Marketplace bid command sent: %s", command)
+   )
+end
+
+function market_refresh()
+   if market_plugin.detail_window and market_plugin.detail_window.id and market_plugin.current_detail_num then
+      market_capture_detail(market_plugin.current_detail_num)
+      return
+   end
+
+   market_capture_list(market_plugin.last_list_command or "lbid")
+end
+
+function market_show_mybids()
+   market_plugin.pending_after_list = report_mybids
+   market_capture_list("lbid")
+end
+
+function OnPluginDisable()
+   if market_plugin.list_window and market_plugin.list_window.id then
+      market_plugin.list_window:delete()
+      market_plugin.list_window = nil
+   end
+
+   if market_plugin.detail_window and market_plugin.detail_window.id then
+      market_plugin.detail_window:delete()
+      market_plugin.detail_window = nil
+   end
+end
+]]>
+</script>
+
+</muclient>
