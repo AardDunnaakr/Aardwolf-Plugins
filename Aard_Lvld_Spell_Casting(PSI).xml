@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+
+<plugin
+   name="Psionicist_Highest_Spell"
+   author="Dunnaakr"
+   id="7f0ad2ce1d8e5ddb83f8f422"
+   language="Lua"
+   purpose="Auto highest psionicist spells with manual + auto level support"
+   date_written="2026-05-17"
+   requires="5.07"
+   version="1.4"
+>
+
+</plugin>
+
+<aliases>
+    <alias
+       match="^hspell(?:\s+(.+))?$"
+       regexp="y"
+       enabled="y"
+       send_to="12"
+       script="hspell_command"
+    />
+    <alias
+       match="^haoe(?:\s+(.+))?$"
+       regexp="y"
+       enabled="y"
+       send_to="12"
+       script="haoe_command"
+    />
+</aliases>
+
+<script>
+<![CDATA[
+local player_level = 1
+
+-- ====================== SINGLE TARGET SPELLS ======================
+local single_target_spells = {
+    {lvl = 1,   cast = 101, name = "Ballistic attack"},
+    {lvl = 7,   cast = 127, name = "Mind thrust"},
+    {lvl = 9,   cast = 131, name = "Psychic drain"},
+    {lvl = 12,  cast = 115, name = "Ego whip"},
+    {lvl = 15,  cast = 98,  name = "Agitation"},
+    {lvl = 21,  cast = 122, name = "Inflict pain"},
+    {lvl = 25,  cast = 196, name = "Telekinesis"},
+    {lvl = 31,  cast = 353, name = "Mind freeze"},
+    {lvl = 34,  cast = 107, name = "Control flames"},
+    {lvl = 39,  cast = 355, name = "Nerve shock"},
+    {lvl = 43,  cast = 130, name = "Psychic crush"},
+    {lvl = 49,  cast = 294, name = "Cause decay"},
+    {lvl = 55,  cast = 200, name = "Acidic touch"},
+    {lvl = 60,  cast = 354, name = "Neural burn"},
+    {lvl = 65,  cast = 128, name = "Project force"},
+    {lvl = 74,  cast = 129, name = "Psionic blast"},
+    {lvl = 86,  cast = 110, name = "Detonate"},
+    {lvl = 94,  cast = 357, name = "Trauma"},
+    {lvl = 108, cast = 356, name = "Psychosis"},
+    {lvl = 117, cast = 357, name = "Spasm"},
+    {lvl = 124, cast = 359, name = "Nightmare touch"},
+    {lvl = 136, cast = 233, name = "Megablast"},
+    {lvl = 151, cast = 360, name = "Neural overload"},
+    {lvl = 164, cast = 234, name = "Pyromania"},
+    {lvl = 179, cast = 362, name = "Desolation"},
+}
+
+-- ====================== AOE SPELLS ======================
+local aoe_spells = {
+    {lvl = 73,  cast = 136, name = "Ultrablast"},
+    {lvl = 99,  cast = 109, name = "Death field"},
+}
+
+local function get_highest_spell(spell_list, level)
+    local best = nil
+    for _, spell in ipairs(spell_list) do
+        if spell.lvl <= level then
+            if not best or spell.lvl > best.lvl then
+                best = spell
+            end
+        end
+    end
+    return best
+end
+
+local function show_spell_list(spell_list, title, color)
+    ColourNote("white", "", "")
+    ColourNote(color or "cyan", "", "=== " .. title .. " ===")
+    ColourNote("white", "", "Lvl | Cast# | Spell Name")
+    ColourNote("white", "", string.rep("-", 45))
+
+    for _, spell in ipairs(spell_list) do
+        local status = (spell.lvl <= player_level) and "✓" or "✗"
+        ColourNote("white", "", string.format("%3d | %4d  | %s %s", spell.lvl, spell.cast, status, spell.name))
+    end
+    ColourNote("yellow", "", "Current Level: " .. player_level)
+    ColourNote("white", "", "")
+end
+
+-- Now allows setting level higher OR lower
+function update_player_level(new_level)
+    new_level = tonumber(new_level)
+    if not new_level or new_level < 1 then 
+        ColourNote("red", "", "[Error] Invalid level")
+        return 
+    end
+
+    if new_level ~= player_level then
+        local old = player_level
+        player_level = new_level
+        ColourNote("paleturquoise", "", "[Level Set] " .. old .. " → " .. new_level)
+    end
+end
+
+-- ====================== COMMANDS ======================
+function hspell_command(name, line, wildcards)
+    local arg = wildcards[1] and string.lower(trim(wildcards[1])) or ""
+
+    if arg == "list" or arg == "l" then
+        show_spell_list(single_target_spells, "Primary Psionicist Single Target Spells", "cyan")
+        return
+    end
+
+    -- Manual level set (any number)
+    if arg:match("^%d+$") then
+        update_player_level(arg)
+        return
+    end
+
+    -- Normal cast
+    local spell = get_highest_spell(single_target_spells, player_level)
+    if spell then
+        SendNoEcho("cast " .. spell.cast)
+        ColourNote("cyan", "", "[HSpell] Casting #" .. spell.cast .. " → " .. spell.name .. " (Lvl " .. spell.lvl .. ")")
+    end
+end
+
+function haoe_command(name, line, wildcards)
+    local arg = wildcards[1] and string.lower(trim(wildcards[1])) or ""
+
+    if arg == "list" or arg == "l" then
+        show_spell_list(aoe_spells, "Primary Psionicist AOE Spells", "magenta")
+        return
+    end
+
+    local spell = get_highest_spell(aoe_spells, player_level)
+    if spell then
+        SendNoEcho("cast " .. spell.cast)
+        ColourNote("magenta", "", "[HAoE] Casting #" .. spell.cast .. " → " .. spell.name .. " (Lvl " .. spell.lvl .. ")")
+    end
+end
+
+function trim(s)
+    return (s or ""):match("^%s*(.-)%s*$")
+end
+
+-- ====================== AUTO LEVEL DETECTION ======================
+
+function OnLevelUp(name, line, wildcards)
+    update_player_level(wildcards[1])
+end
+
+function OnScoreLevel(name, line, wildcards)
+    update_player_level(wildcards[1])
+end
+
+function OnPluginInstall()
+    ColourNote("paleturquoise", "", "[Psionicist Helper] v1.4 loaded!")
+    ColourNote("paleturquoise", "", "   Commands:")
+    ColourNote("paleturquoise", "", "     hspell          → cast best spell")
+    ColourNote("paleturquoise", "", "     hspell list     → show all spells")
+    ColourNote("paleturquoise", "", "     hspell 154      → set your level manually (any number)")
+
+    -- Level-up trigger
+    AddTrigger("level_up_trigger", 
+               "^You advance to level (\\d+)!.*$", 
+               "", 1, 12, 0, "", "OnLevelUp", 1)
+
+    -- Score trigger
+    AddTrigger("score_level_trigger", 
+               "^You are a .* level (\\d+) .*$", 
+               "", 1, 12, 0, "", "OnScoreLevel", 1)
+
+    -- Try to get current level automatically
+    DoAfterSpecial(2, "SendNoEcho('score')", sendto.script)
+end
+
+function OnPluginClose()
+    DeleteTrigger("level_up_trigger")
+    DeleteTrigger("score_level_trigger")
+end
+]]>
+</script>
+
+</muclient>
