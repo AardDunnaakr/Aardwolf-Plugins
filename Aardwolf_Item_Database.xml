@@ -1,0 +1,1543 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+
+<plugin
+   name="Aardwolf_Item_Database"
+   author="Dunnaakr "
+   id="7f0ad2ce1d7e4dd7b83f8f42"
+   language="Lua"
+   purpose="Builds a searchable item database from loot sources and identify output."
+   date_written="2026-05-24"
+   requires="5.07"
+   version="0.9"
+   save_state="y"
+>
+</plugin>
+
+<aliases>
+<alias
+   match="^idb( .*)?$"
+   regexp="y"
+   enabled="y"
+   sequence="100"
+   ignore_case="y"
+   send_to="12"
+   script="idb_command"
+/>
+</aliases>
+
+<triggers>
+<trigger
+   name="idb_loot_item"
+   enabled="y"
+   regexp="y"
+   sequence="101"
+   match="^You get (?<item>.+) from the .* corpse of (?<mob>.+)\.$"
+   send_to="12"
+   script="idb_track_item"
+/>
+</triggers>
+
+<script>
+<![CDATA[
+require "serialize"
+require "gmcphelper"
+require "wrapped_captures"
+
+local DB_FILE_NAME = "item_database.lua"
+local SUMMARY_FILE_NAME = "item_database_summary.txt"
+local REPORT_FILE_NAME = "item_database_report.txt"
+local IDENTIFY_DELAY = 0.2
+
+local BLOOT_PREFIXES = {
+   polished = true,
+   enhanced = true,
+   burnished = true,
+   shiny = true,
+   vibrant = true,
+   sparkling = true,
+   gleaming = true,
+   shimmering = true,
+   dazzling = true,
+   brilliant = true,
+   radiant = true,
+   wondrous = true,
+   majestic = true,
+   exalted = true,
+   eternal = true,
+   legendary = true,
+   epic = true,
+   mythical = true,
+   fabled = true,
+   divine = true,
+   godly = true,
+}
+
+local STAT_ALIASES = {
+   dam = "Average Dam",
+   avgdam = "Average Dam",
+   averagedam = "Average Dam",
+   averagedamage = "Average Dam",
+   damage = "Average Dam",
+   avg = "Average Dam",
+   hr = "Hit roll",
+   hitroll = "Hit roll",
+   dr = "Damage roll",
+   damroll = "Damage roll",
+   damageroll = "Damage roll",
+   hp = "Hit points",
+   hitpoint = "Hit points",
+   hitpoints = "Hit points",
+   mana = "Mana",
+   move = "Moves",
+   moves = "Moves",
+   str = "Strength",
+   strength = "Strength",
+   dex = "Dexterity",
+   dexterity = "Dexterity",
+   con = "Constitution",
+   constitution = "Constitution",
+   int = "Intelligence",
+   intelligence = "Intelligence",
+   wis = "Wisdom",
+   wisdom = "Wisdom",
+   luc = "Luck",
+   luck = "Luck",
+   score = "Score",
+   weight = "Weight",
+   worth = "Worth",
+}
+
+local idb = {
+   db = nil,
+   player_name = "",
+   pending_save_scheduled = false,
+   search_cache = {
+      groups = {},
+      stat_results = {},
+      highest_results = {},
+   },
+   capture = {
+      active = false,
+      queue = {},
+      index = 0,
+      started_at = nil,
+      session_added = 0,
+      session_updated = 0,
+      session_failed = 0,
+      recent_only = true,
+   },
+}
+
+local function trim(s)
+   s = tostring(s or "")
+   s = s:gsub("^%s+", "")
+   s = s:gsub("%s+$", "")
+   return s
+end
+
+local function collapse_spaces(s)
+   return trim((s or ""):gsub("%s+", " "))
+end
+
+local function safe_tonumber(value)
+   if value == nil then
+      return nil
+   end
+   value = tostring(value):gsub(",", "")
+   return tonumber(value)
+end
+
+local function current_timestamp()
+   return os.date("%Y-%m-%d %H:%M:%S")
+end
+
+local function get_plugin_directory()
+   return GetPluginInfo(GetPluginID(), 20)
+end
+
+local function get_db_path()
+   return get_plugin_directory() .. DB_FILE_NAME
+end
+
+local function get_summary_path()
+   return get_plugin_directory() .. SUMMARY_FILE_NAME
+end
+
+local function get_report_path()
+   return get_plugin_directory() .. REPORT_FILE_NAME
+end
+
+local function get_current_area()
+   local area = gmcp("room.info.zone") or gmcp("room.info.area") or ""
+   return trim(area)
+end
+
+local function refresh_player_name()
+   local gmcp_name = trim(gmcp("char.base.name") or "")
+   if gmcp_name ~= "" then
+      idb.player_name = gmcp_name
+      SetVariable("player_name", gmcp_name)
+      return gmcp_name
+   end
+
+   local saved_name = trim(GetVariable("player_name") or "")
+   if saved_name ~= "" then
+      idb.player_name = saved_name
+   end
+
+   return idb.player_name or ""
+end
+
+local function get_player_name()
+   return refresh_player_name()
+end
+
+local function normalize_item_name(name)
+   name = trim(name)
+   name = name:gsub("|%[", "")
+   name = name:gsub("%]|", "")
+   name = collapse_spaces(name)
+   return string.lower(name)
+end
+
+local function normalize_token(value)
+   return normalize_item_name(value):gsub("%s+", "")
+end
+
+local function split_bloot_name(name)
+   name = trim(name)
+   local prefix, rest = name:match("^%(([%a]+)%)%s+(.+)$")
+   if prefix and BLOOT_PREFIXES[string.lower(prefix)] then
+      return prefix, trim(rest)
+   end
+   return nil, name
+end
+
+local function clean_inventory_name(name)
+   name = trim(name)
+   while name:match("^%(%s*%d+%)") do
+      name = name:gsub("^%(%s*%d+%)", "")
+      name = trim(name)
+   end
+   while name:match("^%([A-Z]%)") do
+      name = name:gsub("^%([A-Z]%)", "")
+      name = trim(name)
+   end
+   return collapse_spaces(name)
+end
+
+local function styles_line_to_text(style_line)
+   local parts = {}
+   for _, part in ipairs(style_line or {}) do
+      table.insert(parts, part.text or "")
+   end
+   return table.concat(parts)
+end
+
+local function capture_lines_to_text(captured_styles)
+   local lines = {}
+   for _, line_styles in ipairs(captured_styles or {}) do
+      table.insert(lines, styles_line_to_text(line_styles))
+   end
+   return lines
+end
+
+local function clone_style_lines(captured_styles)
+   local cloned = {}
+   for i, line_styles in ipairs(captured_styles or {}) do
+      cloned[i] = {}
+      for j, part in ipairs(line_styles or {}) do
+         cloned[i][j] = {
+            text = part.text or "",
+            length = part.length,
+            textcolour = part.textcolour,
+            backcolour = part.backcolour,
+            style = part.style,
+         }
+      end
+   end
+   return cloned
+end
+
+local function notify(msg)
+   ColourNote("paleturquoise", "", "[IDB] " .. msg)
+end
+
+local function warn(msg)
+   ColourNote("white", "red", "[IDB] " .. msg)
+end
+
+local function ensure_db()
+   if idb.db then
+      return
+   end
+
+   idb.db = {
+      meta = {
+         created_at = current_timestamp(),
+         updated_at = current_timestamp(),
+         capture_runs = 0,
+         total_records = 0,
+         total_sources = 0,
+         total_identifies = 0,
+         total_loot_sightings = 0,
+      },
+      next_record_id = 1,
+      records = {},
+      by_fingerprint = {},
+      pending_sources = {},
+   }
+end
+
+local function normalize_record_fields(record)
+   record.sources = record.sources or {}
+   record.identify_fields = record.identify_fields or {}
+   record.identify_styles = record.identify_styles or {}
+   record.identify_raw = record.identify_raw or ""
+   record.added_by = record.added_by or ""
+   local prefix, base_name = split_bloot_name(record.name or "")
+   record.base_name = record.base_name or base_name or (record.name or "")
+   record.bloot_prefix = record.bloot_prefix or prefix
+   record.is_bloot = record.is_bloot or (record.bloot_prefix ~= nil)
+end
+
+local function load_db()
+   ensure_db()
+
+   local db_path = get_db_path()
+   local chunk, err = loadfile(db_path)
+   if not chunk then
+      return false, err
+   end
+
+   local ok, loaded = pcall(chunk)
+   if not ok or type(loaded) ~= "table" then
+      return false, loaded
+   end
+
+   idb.db = loaded
+   idb.db.meta = idb.db.meta or {}
+   idb.db.records = idb.db.records or {}
+   idb.db.by_fingerprint = idb.db.by_fingerprint or {}
+   idb.db.pending_sources = idb.db.pending_sources or {}
+   idb.db.next_record_id = tonumber(idb.db.next_record_id) or 1
+   idb.db.meta.capture_runs = tonumber(idb.db.meta.capture_runs) or 0
+   idb.db.meta.total_records = tonumber(idb.db.meta.total_records) or 0
+   idb.db.meta.total_sources = tonumber(idb.db.meta.total_sources) or 0
+   idb.db.meta.total_identifies = tonumber(idb.db.meta.total_identifies) or 0
+   idb.db.meta.total_loot_sightings = tonumber(idb.db.meta.total_loot_sightings) or 0
+
+   for _, record in pairs(idb.db.records) do
+      normalize_record_fields(record)
+   end
+
+   return true
+end
+
+local function serialize_lua(value, indent)
+   indent = indent or 0
+   local pad = string.rep("  ", indent)
+   local next_pad = string.rep("  ", indent + 1)
+   local t = type(value)
+
+   if t == "nil" then
+      return "nil"
+   elseif t == "number" or t == "boolean" then
+      return tostring(value)
+   elseif t == "string" then
+      return string.format("%q", value)
+   elseif t ~= "table" then
+      return string.format("%q", tostring(value))
+   end
+
+   local keys = {}
+   for k in pairs(value) do
+      table.insert(keys, k)
+   end
+
+   table.sort(keys, function(a, b)
+      if type(a) == type(b) then
+         return tostring(a) < tostring(b)
+      end
+      return type(a) < type(b)
+   end)
+
+   local is_array = true
+   for i, k in ipairs(keys) do
+      if k ~= i then
+         is_array = false
+         break
+      end
+   end
+
+   local lines = {"{"}
+   for _, key in ipairs(keys) do
+      local encoded_value = serialize_lua(value[key], indent + 1)
+      if is_array then
+         table.insert(lines, next_pad .. encoded_value .. ",")
+      else
+         local encoded_key
+         if type(key) == "string" and key:match("^[A-Za-z_][A-Za-z0-9_]*$") then
+            encoded_key = key
+         else
+            encoded_key = "[" .. serialize_lua(key, 0) .. "]"
+         end
+         table.insert(lines, next_pad .. encoded_key .. " = " .. encoded_value .. ",")
+      end
+   end
+   table.insert(lines, pad .. "}")
+   return table.concat(lines, "\n")
+end
+
+local function write_text_file(path, text)
+   local file, err = io.open(path, "w")
+   if not file then
+      return false, err
+   end
+   file:write(text)
+   file:close()
+   return true
+end
+
+local function pending_source_count()
+   ensure_db()
+   local count = 0
+   for _, queue in pairs(idb.db.pending_sources or {}) do
+      count = count + #queue
+   end
+   return count
+end
+
+local function build_pending_target_counts()
+   ensure_db()
+   local counts = {}
+   for key, queue in pairs(idb.db.pending_sources or {}) do
+      if queue and #queue > 0 then
+         counts[key] = #queue
+      end
+   end
+   return counts
+end
+
+local function backfill_missing_added_by()
+   local player_name = refresh_player_name()
+   if player_name == "" then
+      return false
+   end
+
+   local changed = false
+   for _, record in pairs(idb.db.records or {}) do
+      normalize_record_fields(record)
+      if trim(record.added_by or "") == "" then
+         record.added_by = player_name
+         changed = true
+      end
+   end
+
+   return changed
+end
+
+local function write_summary_files()
+   ensure_db()
+
+   local summary_lines = {
+      "Aardwolf Item Database Summary",
+      "Generated: " .. current_timestamp(),
+      "",
+      "Record ID | Name | Level | Type | Wearable | Found At | Drop Mob | Drop Area | Added By",
+      string.rep("-", 128),
+   }
+
+   local records = {}
+   for _, record in pairs(idb.db.records) do
+      normalize_record_fields(record)
+      table.insert(records, record)
+   end
+   table.sort(records, function(a, b)
+      if normalize_item_name(a.base_name or a.name or "") == normalize_item_name(b.base_name or b.name or "") then
+         return tonumber(a.level or 0) < tonumber(b.level or 0)
+      end
+      return normalize_item_name(a.base_name or a.name or "") < normalize_item_name(b.base_name or b.name or "")
+   end)
+
+   local total_sources = 0
+   for _, record in ipairs(records) do
+      if #record.sources == 0 then
+         table.insert(summary_lines, string.format(
+            "%s | %s | %s | %s | %s | %s | %s | %s | %s",
+            tostring(record.record_id or ""),
+            record.name or "",
+            record.level or "",
+            record.item_type or "",
+            record.wearable or "",
+            record.found_at or "",
+            "",
+            "",
+            record.added_by or ""
+         ))
+      else
+         for _, source in ipairs(record.sources) do
+            total_sources = total_sources + 1
+            table.insert(summary_lines, string.format(
+               "%s | %s | %s | %s | %s | %s | %s | %s | %s",
+               tostring(record.record_id or ""),
+               record.name or "",
+               record.level or "",
+               record.item_type or "",
+               record.wearable or "",
+               record.found_at or "",
+               source.mob or "",
+               source.area or "",
+               record.added_by or ""
+            ))
+         end
+      end
+   end
+
+   local report_lines = {
+      "Aardwolf Item Database Report",
+      "Generated: " .. current_timestamp(),
+      "",
+      "Capture runs: " .. tostring(idb.db.meta.capture_runs or 0),
+      "Unique records: " .. tostring(#records),
+      "Total source sightings: " .. tostring(total_sources),
+      "Pending loot entries: " .. tostring(pending_source_count()),
+      "Total identify captures: " .. tostring(idb.db.meta.total_identifies or 0),
+      "Database file: " .. get_db_path(),
+      "Summary file: " .. get_summary_path(),
+   }
+
+   write_text_file(get_summary_path(), table.concat(summary_lines, "\n"))
+   write_text_file(get_report_path(), table.concat(report_lines, "\n"))
+end
+
+local function save_db(write_summaries)
+   ensure_db()
+   idb.db.meta.updated_at = current_timestamp()
+   local serialized = "return " .. serialize_lua(idb.db, 0) .. "\n"
+   local ok, err = write_text_file(get_db_path(), serialized)
+   if not ok then
+      warn("Failed to write database file: " .. tostring(err))
+      return false
+   end
+   if write_summaries ~= false then
+      write_summary_files()
+   end
+   return true
+end
+
+function idb_flush_scheduled_save()
+   idb.pending_save_scheduled = false
+   save_db(false)
+end
+
+local function schedule_db_save()
+   if idb.pending_save_scheduled then
+      return
+   end
+
+   idb.pending_save_scheduled = true
+   DoAfterSpecial(2, "idb_flush_scheduled_save()", sendto.script)
+end
+
+local function add_loot_source(item_name, source)
+   ensure_db()
+   local key = normalize_item_name(item_name)
+   idb.db.pending_sources[key] = idb.db.pending_sources[key] or {}
+   table.insert(idb.db.pending_sources[key], source)
+   idb.db.meta.total_loot_sightings = (idb.db.meta.total_loot_sightings or 0) + 1
+end
+
+local function consume_loot_source(name_a, name_b)
+   ensure_db()
+   local candidates = {name_a, name_b}
+   for _, candidate in ipairs(candidates) do
+      local key = normalize_item_name(candidate or "")
+      local queue = idb.db.pending_sources[key]
+      if queue and #queue > 0 then
+         return table.remove(queue, 1)
+      end
+   end
+   return nil
+end
+
+local function fingerprint_for(item)
+   return table.concat({
+      normalize_item_name(item.name or ""),
+      trim(item.level or ""),
+      trim(item.item_type or ""),
+      trim(item.wearable or ""),
+      trim(item.found_at or ""),
+      trim(item.identify_raw or ""),
+   }, "|")
+end
+
+local function find_source(record, source)
+   for _, existing in ipairs(record.sources or {}) do
+      if (existing.mob or "") == (source.mob or "")
+         and (existing.area or "") == (source.area or "") then
+         return existing
+      end
+   end
+   return nil
+end
+
+local function add_or_update_record(item, source)
+   ensure_db()
+
+   local fingerprint = fingerprint_for(item)
+   local record_id = idb.db.by_fingerprint[fingerprint]
+   local is_new = false
+   local record
+
+   if record_id and idb.db.records[record_id] then
+      record = idb.db.records[record_id]
+   else
+      is_new = true
+      record = {
+         record_id = idb.db.next_record_id,
+         fingerprint = fingerprint,
+         name = item.name or "",
+         base_name = item.base_name or item.name or "",
+         bloot_prefix = item.bloot_prefix,
+         is_bloot = item.is_bloot or false,
+         item_type = item.item_type or "",
+         level = item.level or "",
+         identify_id = item.identify_id or "",
+         keywords = item.keywords or "",
+         flags = item.flags or "",
+         found_at = item.found_at or "",
+         wearable = item.wearable or "",
+         identify_fields = item.fields or {},
+         identify_raw = item.identify_raw or "",
+         identify_styles = item.identify_styles or {},
+         first_seen_at = current_timestamp(),
+         last_seen_at = current_timestamp(),
+         seen_count = 0,
+         sources = {},
+         added_by = item.added_by or "",
+      }
+      idb.db.records[record.record_id] = record
+      idb.db.by_fingerprint[fingerprint] = record.record_id
+      idb.db.next_record_id = record.record_id + 1
+      idb.db.meta.total_records = (idb.db.meta.total_records or 0) + 1
+   end
+
+   normalize_record_fields(record)
+   record.last_seen_at = current_timestamp()
+   record.seen_count = (record.seen_count or 0) + 1
+   record.identify_fields = item.fields or record.identify_fields
+   record.identify_raw = item.identify_raw or record.identify_raw
+   record.identify_styles = item.identify_styles or record.identify_styles
+   record.identify_id = item.identify_id or record.identify_id
+   record.keywords = item.keywords or record.keywords
+   record.flags = item.flags or record.flags
+   record.found_at = item.found_at or record.found_at
+   record.wearable = item.wearable or record.wearable
+   record.level = item.level or record.level
+   record.item_type = item.item_type or record.item_type
+   record.name = item.name or record.name
+   record.base_name = item.base_name or record.base_name
+   record.bloot_prefix = item.bloot_prefix or record.bloot_prefix
+   record.is_bloot = item.is_bloot or record.is_bloot
+   if trim(record.added_by or "") == "" then
+      record.added_by = item.added_by or ""
+   end
+
+   if source then
+      local existing_source = find_source(record, source)
+      if existing_source then
+         existing_source.count = (existing_source.count or 1) + 1
+         existing_source.last_seen_at = current_timestamp()
+      else
+         source.count = 1
+         source.first_seen_at = current_timestamp()
+         source.last_seen_at = current_timestamp()
+         table.insert(record.sources, source)
+         idb.db.meta.total_sources = (idb.db.meta.total_sources or 0) + 1
+      end
+   end
+
+   return record, is_new
+end
+
+local function record_unique_signature(record)
+   return table.concat({
+      normalize_item_name(record.name or ""),
+      trim(record.level or ""),
+      trim(record.item_type or ""),
+      trim(record.wearable or ""),
+      trim(record.identify_raw or ""),
+   }, "|")
+end
+
+local function dedupe_records(records)
+   local deduped = {}
+   local seen = {}
+   for _, record in ipairs(records or {}) do
+      local signature = record_unique_signature(record)
+      if not seen[signature] then
+         seen[signature] = true
+         table.insert(deduped, record)
+      end
+   end
+   return deduped
+end
+
+local function parse_inventory_serial_line(line)
+   local name, serials, level = line:match("^%s*(.-)%s+%[([%d,]+)%]%s+%((%d+)%)%s*$")
+   if not name or not serials then
+      return nil
+   end
+
+   name = clean_inventory_name(name)
+   if name == "" then
+      return nil
+   end
+
+   local entries = {}
+   for serial in tostring(serials):gmatch("%d+") do
+      table.insert(entries, {
+         display_name = name,
+         serial = serial,
+         level = level,
+      })
+   end
+
+   if #entries == 0 then
+      return nil
+   end
+
+   return entries
+end
+
+local function parse_identify_block(lines)
+   local item = {
+      fields = {},
+      raw_lines = {},
+      identify_raw = "",
+      name = "",
+      base_name = "",
+      bloot_prefix = nil,
+      is_bloot = false,
+      item_type = "",
+      level = "",
+      identify_id = "",
+      keywords = "",
+      flags = "",
+      found_at = "",
+      wearable = "",
+   }
+
+   local current_key = nil
+
+   local function append_field(key, value)
+      key = trim(key)
+      value = trim(value)
+      if key == "" then
+         return
+      end
+
+      if item.fields[key] and item.fields[key] ~= "" then
+         item.fields[key] = item.fields[key] .. " " .. value
+      else
+         item.fields[key] = value
+      end
+      current_key = key
+   end
+
+   local function parse_single(inner)
+      local key, value = inner:match("^%s*([^:]-)%s*:%s*(.-)%s*$")
+      key = trim(key)
+      value = trim(value)
+      if key == "" then
+         return false
+      end
+      append_field(key, value)
+      return true
+   end
+
+   for _, line_text in ipairs(lines or {}) do
+      if line_text:match("^%+") or line_text:match("^|") then
+         table.insert(item.raw_lines, line_text)
+      end
+
+      if line_text:match("^|") then
+         local inner = line_text:gsub("^|", ""):gsub("|%s*$", "")
+         if not inner:match("^%s*$") then
+            local right_half = inner:sub(34)
+            if right_half:match("%S.-:%s*") then
+               local left = trim(inner:sub(1, 33))
+               local right = trim(right_half)
+               local left_ok = parse_single(left)
+               local right_ok = parse_single(right)
+               if not left_ok and not right_ok then
+                  local continuation = inner:match("^%s*:%s*(.-)%s*$")
+                  if continuation and current_key then
+                     append_field(current_key, continuation)
+                  end
+               end
+            else
+               local ok = parse_single(inner)
+               if not ok then
+                  local continuation = inner:match("^%s*:%s*(.-)%s*$")
+                  if continuation and current_key then
+                     append_field(current_key, continuation)
+                  end
+               end
+            end
+         end
+      end
+   end
+
+   item.identify_raw = table.concat(item.raw_lines, "\n")
+   item.name = item.fields["Name"] or ""
+   item.item_type = item.fields["Type"] or ""
+   item.level = item.fields["Level"] or ""
+   item.identify_id = item.fields["Id"] or ""
+   item.keywords = item.fields["Keywords"] or ""
+   item.flags = item.fields["Flags"] or ""
+   item.found_at = item.fields["Found at"] or ""
+   item.wearable = item.fields["Wearable"] or ""
+
+   local prefix, base_name = split_bloot_name(item.name)
+   item.bloot_prefix = prefix
+   item.base_name = base_name or item.name
+   item.is_bloot = prefix ~= nil
+
+   if item.name == "" and item.identify_raw == "" then
+      return nil
+   end
+
+   return item
+end
+
+local function rgb_name(value, fallback)
+   if type(value) == "number" then
+      return RGBColourToName(value)
+   end
+   if type(value) == "string" and value ~= "" then
+      return value
+   end
+   return fallback or "white"
+end
+
+local function replay_style_line(style_line)
+   for _, part in ipairs(style_line or {}) do
+      ColourTell(
+         rgb_name(part.textcolour, "white"),
+         rgb_name(part.backcolour, "black"),
+         part.text or ""
+      )
+   end
+   Note("")
+end
+
+local function sort_records_for_variants(records)
+   table.sort(records, function(a, b)
+      local a_level = tonumber(a.level or 0) or 0
+      local b_level = tonumber(b.level or 0) or 0
+      if a_level == b_level then
+         return normalize_item_name(a.name or "") < normalize_item_name(b.name or "")
+      end
+      return a_level < b_level
+   end)
+end
+
+local function record_matches_type_or_wearable(record, search_term)
+   local normalized_term = normalize_item_name(search_term)
+   local item_type = normalize_item_name(record.item_type or "")
+   local wearable = normalize_item_name(record.wearable or "")
+   if item_type:find(normalized_term, 1, true) then
+      return true
+   end
+   if wearable:find(normalized_term, 1, true) then
+      return true
+   end
+   return false
+end
+
+local function build_name_groups(query, bloot_only)
+   ensure_db()
+   local normalized_query = normalize_item_name(query)
+   local grouped = {}
+
+   for _, record in pairs(idb.db.records) do
+      normalize_record_fields(record)
+      if (not bloot_only or record.is_bloot) then
+         local search_haystack = string.lower(table.concat({
+            record.base_name or "",
+            record.name or "",
+         }, " "))
+
+         if search_haystack:find(normalized_query, 1, true) then
+            local key = normalize_item_name(record.base_name or record.name or "")
+            grouped[key] = grouped[key] or {
+               base_name = record.base_name or record.name or "",
+               records = {},
+            }
+            table.insert(grouped[key].records, record)
+         end
+      end
+   end
+
+   local results = {}
+   for key, group in pairs(grouped) do
+      group.records = dedupe_records(group.records)
+      sort_records_for_variants(group.records)
+      group.key = key
+      table.insert(results, group)
+   end
+
+   table.sort(results, function(a, b)
+      return normalize_item_name(a.base_name or "") < normalize_item_name(b.base_name or "")
+   end)
+
+   return results
+end
+
+local function search_records_by_stats(item_type, min_level, max_level)
+   ensure_db()
+   local matches = {}
+
+   for _, record in pairs(idb.db.records) do
+      normalize_record_fields(record)
+      local level = tonumber(record.level or 0)
+      if level and level >= min_level and level <= max_level and record_matches_type_or_wearable(record, item_type) then
+         table.insert(matches, record)
+      end
+   end
+
+   matches = dedupe_records(matches)
+   sort_records_for_variants(matches)
+   return matches
+end
+
+local function resolve_stat_alias(stat_name)
+   local norm = normalize_token(stat_name)
+   return STAT_ALIASES[norm]
+end
+
+local function get_record_stat_value(record, stat_name)
+   local wanted_alias = resolve_stat_alias(stat_name)
+   local wanted_norm = normalize_item_name(stat_name)
+   local wanted_token = normalize_token(stat_name)
+   local alias_norm = wanted_alias and normalize_item_name(wanted_alias) or nil
+   local alias_token = wanted_alias and normalize_token(wanted_alias) or nil
+
+   for key, value in pairs(record.identify_fields or {}) do
+      local key_norm = normalize_item_name(key)
+      local key_token = normalize_token(key)
+      local matches = false
+
+      if alias_norm and (key_norm == alias_norm or key_token == alias_token) then
+         matches = true
+      elseif key_norm == wanted_norm or key_token == wanted_token then
+         matches = true
+      elseif key_norm:find(wanted_norm, 1, true) then
+         matches = true
+      end
+
+      if matches then
+         local number_text = tostring(value or ""):match("[%+%-]?[%d,]+")
+         local number_value = safe_tonumber(number_text)
+         if number_value ~= nil then
+            return number_value, key
+         end
+      end
+   end
+
+   return nil, nil
+end
+
+local function dedupe_highest_results(results)
+   local deduped = {}
+   local seen = {}
+   for _, result in ipairs(results or {}) do
+      local key = table.concat({
+         normalize_item_name(result.record.name or ""),
+         tostring(result.stat_value or ""),
+      }, "|")
+      if not seen[key] then
+         seen[key] = true
+         table.insert(deduped, result)
+      end
+   end
+   return deduped
+end
+
+local function search_highest_stat(stat_name, item_type, min_level, max_level)
+   local results = {}
+   local records = search_records_by_stats(item_type, min_level, max_level)
+   for _, record in ipairs(records) do
+      local stat_value, matched_key = get_record_stat_value(record, stat_name)
+      if stat_value ~= nil then
+         table.insert(results, {
+            record = record,
+            stat_value = stat_value,
+            stat_key = matched_key or stat_name,
+         })
+      end
+   end
+
+   table.sort(results, function(a, b)
+      if a.stat_value == b.stat_value then
+         local a_level = tonumber(a.record.level or 0) or 0
+         local b_level = tonumber(b.record.level or 0) or 0
+         if a_level == b_level then
+            return normalize_item_name(a.record.name or "") < normalize_item_name(b.record.name or "")
+         end
+         return a_level < b_level
+      end
+      return a.stat_value > b.stat_value
+   end)
+
+   return dedupe_highest_results(results)
+end
+
+function idb_show_record(record_id)
+   ensure_db()
+   local record = idb.db.records[tonumber(record_id or 0)]
+   if not record then
+      warn("Record not found: " .. tostring(record_id))
+      return
+   end
+
+   normalize_record_fields(record)
+
+   ColourNote("paleturquoise", "", "")
+   ColourNote("paleturquoise", "", "[IDB] Record #" .. tostring(record.record_id))
+   ColourNote("white", "", "Variant   : " .. (record.name or ""))
+   ColourNote("white", "", "Level     : " .. (record.level or ""))
+   ColourNote("white", "", "Type      : " .. (record.item_type or ""))
+   ColourNote("white", "", "Wearable  : " .. (record.wearable or ""))
+   ColourNote("white", "", "Found at  : " .. (record.found_at or ""))
+   ColourNote("white", "", "Keywords  : " .. (record.keywords or ""))
+   ColourNote("white", "", "Flags     : " .. (record.flags or ""))
+   ColourNote("white", "", "Seen count: " .. tostring(record.seen_count or 0))
+
+   if record.sources and #record.sources > 0 then
+      ColourNote("yellow", "", "Sources:")
+      for _, source in ipairs(record.sources) do
+         ColourNote("white", "", string.format(
+            "  %s | %s | seen %s time(s)",
+            source.mob or "Unknown mob",
+            source.area or "Unknown area",
+            tostring(source.count or 1)
+         ))
+      end
+   end
+
+   if record.identify_styles and #record.identify_styles > 0 then
+      ColourNote("yellow", "", "Identify:")
+      for _, style_line in ipairs(record.identify_styles) do
+         replay_style_line(style_line)
+      end
+   elseif record.identify_raw and record.identify_raw ~= "" then
+      ColourNote("yellow", "", "Identify:")
+      for line_text in record.identify_raw:gmatch("[^\r\n]+") do
+         Note(line_text)
+      end
+   end
+
+   ColourNote("white", "", "Added by: " .. (record.added_by or ""))
+end
+
+function idb_show_cached_group(index)
+   local group = idb.search_cache.groups[tonumber(index or 0)]
+   if not group then
+      warn("Search group not found.")
+      return
+   end
+
+   ColourNote("paleturquoise", "", "")
+   ColourNote("paleturquoise", "", "[IDB] Variants for " .. (group.base_name or "item"))
+
+   local records = dedupe_records(group.records or {})
+   sort_records_for_variants(records)
+
+   for _, record in ipairs(records) do
+      local label = string.format("%s [lvl %s] - %s", record.name or "", record.level or "?", record.item_type or "?")
+      Hyperlink(
+         "!!" .. GetPluginID() .. ":idb_show_record(" .. tostring(record.record_id) .. ")",
+         label,
+         "Show full item information",
+         "cyan",
+         0,
+         false
+      )
+      Simulate("\r")
+   end
+end
+
+local function show_grouped_name_results(query, bloot_only)
+   local groups = build_name_groups(query, bloot_only)
+   if #groups == 0 then
+      notify("No matching items found for '" .. query .. "'.")
+      return
+   end
+
+   idb.search_cache.groups = groups
+   notify(string.format(
+      "Found %d unique item match(es) for '%s'%s:",
+      #groups,
+      query,
+      bloot_only and " [bloot only]" or ""
+   ))
+
+   for i, group in ipairs(groups) do
+      local count_text = tostring(#(group.records or {})) .. " variant(s)"
+      Hyperlink(
+         "!!" .. GetPluginID() .. ":idb_show_cached_group(" .. tostring(i) .. ")",
+         string.format("%s [%s]", group.base_name or "item", count_text),
+         "Click to see all level variants",
+         "cyan",
+         0,
+         false
+      )
+      Simulate("\r")
+   end
+end
+
+local function show_stat_search_results(item_type, min_level, max_level)
+   local records = search_records_by_stats(item_type, min_level, max_level)
+   if #records == 0 then
+      notify(string.format(
+         "No items found for type/location '%s' in level range %d-%d.",
+         item_type,
+         min_level,
+         max_level
+      ))
+      return
+   end
+
+   idb.search_cache.stat_results = records
+   notify(string.format(
+      "Found %d matching item variant(s) for type/location '%s' in level range %d-%d:",
+      #records,
+      item_type,
+      min_level,
+      max_level
+   ))
+
+   for _, record in ipairs(records) do
+      local label = string.format("%s [lvl %s] - %s / %s", record.name or "", record.level or "?", record.item_type or "?", record.wearable or "?")
+      Hyperlink(
+         "!!" .. GetPluginID() .. ":idb_show_record(" .. tostring(record.record_id) .. ")",
+         label,
+         "Show full item information",
+         "cyan",
+         0,
+         false
+      )
+      Simulate("\r")
+   end
+end
+
+local function show_highest_search_results(stat_name, item_type, min_level, max_level)
+   local results = search_highest_stat(stat_name, item_type, min_level, max_level)
+   if #results == 0 then
+      notify(string.format(
+         "No items found for highest '%s' in type/location '%s' level range %d-%d.",
+         stat_name,
+         item_type,
+         min_level,
+         max_level
+      ))
+      return
+   end
+
+   idb.search_cache.highest_results = results
+   notify(string.format(
+      "Highest '%s' results for type/location '%s' in level range %d-%d:",
+      stat_name,
+      item_type,
+      min_level,
+      max_level
+   ))
+
+   for _, result in ipairs(results) do
+      local record = result.record
+      local label = string.format(
+         "%s [%s %s] [lvl %s] - %s / %s",
+         record.name or "",
+         result.stat_key or stat_name,
+         tostring(result.stat_value),
+         record.level or "?",
+         record.item_type or "?",
+         record.wearable or "?"
+      )
+      Hyperlink(
+         "!!" .. GetPluginID() .. ":idb_show_record(" .. tostring(record.record_id) .. ")",
+         label,
+         "Show full item information",
+         "cyan",
+         0,
+         false
+      )
+      Simulate("\r")
+   end
+end
+
+function idb_continue_capture()
+   if idb.capture and idb.capture.active then
+      capture_next_identify()
+   end
+end
+
+function finish_capture()
+   local capture = idb.capture
+   capture.active = false
+   ensure_db()
+   idb.db.meta.capture_runs = (idb.db.meta.capture_runs or 0) + 1
+   save_db()
+
+   notify(string.format(
+      "Capture complete. Added %d new records, updated %d existing records, failed %d item(s).",
+      capture.session_added or 0,
+      capture.session_updated or 0,
+      capture.session_failed or 0
+   ))
+end
+
+function capture_next_identify()
+   local capture = idb.capture
+   capture.index = capture.index + 1
+
+   if capture.index > #capture.queue then
+      finish_capture()
+      return
+   end
+
+   local entry = capture.queue[capture.index]
+   notify(string.format("Identifying %d/%d: %s [%s]", capture.index, #capture.queue, entry.display_name, entry.serial))
+
+   Capture.untagged_output(
+      "identify " .. entry.serial,
+      true,
+      true,
+      false,
+      function(captured_styles, start_line, end_line)
+         local lines = capture_lines_to_text(captured_styles)
+         local item = parse_identify_block(lines)
+         if not item then
+            capture.session_failed = (capture.session_failed or 0) + 1
+         else
+            item.identify_styles = clone_style_lines(captured_styles)
+            item.added_by = get_player_name()
+            local source = consume_loot_source(entry.display_name, item.name)
+            local record, is_new = add_or_update_record(item, source)
+            idb.db.meta.total_identifies = (idb.db.meta.total_identifies or 0) + 1
+            if is_new then
+               capture.session_added = (capture.session_added or 0) + 1
+            else
+               capture.session_updated = (capture.session_updated or 0) + 1
+            end
+         end
+         DoAfterSpecial(IDENTIFY_DELAY, "idb_continue_capture()", sendto.script)
+      end,
+      nil,
+      function()
+         warn("Identify timed out for serial " .. tostring(entry.serial))
+         capture.session_failed = (capture.session_failed or 0) + 1
+         DoAfterSpecial(IDENTIFY_DELAY, "idb_continue_capture()", sendto.script)
+      end,
+      30
+   )
+end
+
+local function begin_identify_capture(serial_entries, recent_only)
+   idb.capture = {
+      active = true,
+      queue = serial_entries,
+      index = 0,
+      started_at = current_timestamp(),
+      session_added = 0,
+      session_updated = 0,
+      session_failed = 0,
+      recent_only = recent_only,
+   }
+
+   if #serial_entries == 0 then
+      if recent_only then
+         warn("No recently looted items were found to identify.")
+      else
+         warn("No inventory items were found to identify.")
+      end
+      idb.capture.active = false
+      return
+   end
+
+   notify(string.format(
+      "Inventory capture found %d item(s). Starting identify pass%s.",
+      #serial_entries,
+      recent_only and " for recent loot only" or ""
+   ))
+   capture_next_identify()
+end
+
+local function parse_inventory_capture(lines, recent_only)
+   local entries = {}
+   local seen_serials = {}
+   local target_counts = recent_only and build_pending_target_counts() or nil
+
+   for _, line_text in ipairs(lines or {}) do
+      local parsed_entries = parse_inventory_serial_line(line_text)
+      if parsed_entries then
+         for _, parsed in ipairs(parsed_entries) do
+            if not seen_serials[parsed.serial] then
+               local include_entry = true
+               if recent_only then
+                  local key = normalize_item_name(parsed.display_name)
+                  local remaining = target_counts[key] or 0
+                  include_entry = remaining > 0
+                  if include_entry then
+                     target_counts[key] = remaining - 1
+                  end
+               end
+
+               if include_entry then
+                  seen_serials[parsed.serial] = true
+                  table.insert(entries, parsed)
+               end
+            end
+         end
+      end
+   end
+
+   return entries
+end
+
+local function start_capture(recent_only)
+   if idb.capture.active then
+      warn("A capture is already running.")
+      return
+   end
+
+   if recent_only and pending_source_count() == 0 then
+      warn("No recently looted items are waiting to be identified.")
+      return
+   end
+
+   notify(recent_only and
+      "Starting capture from inventory serials for recent loot only..." or
+      "Starting capture from inventory serials for all inventory items...")
+
+   Capture.untagged_output(
+      "inventory serials",
+      true,
+      true,
+      false,
+      function(captured_styles, start_line, end_line)
+         local lines = capture_lines_to_text(captured_styles)
+         local entries = parse_inventory_capture(lines, recent_only)
+         begin_identify_capture(entries, recent_only)
+      end,
+      true,
+      function()
+         warn("Timed out while capturing inventory serials.")
+      end,
+      30
+   )
+end
+
+local function show_report()
+   ensure_db()
+   local total_records = 0
+   for _ in pairs(idb.db.records) do
+      total_records = total_records + 1
+   end
+
+   notify("Capture runs: " .. tostring(idb.db.meta.capture_runs or 0))
+   notify("Database started: " .. tostring(idb.db.meta.created_at or ""))
+   notify("Known player: " .. (get_player_name() ~= "" and get_player_name() or "[unknown]"))
+   notify("Unique records: " .. tostring(total_records) ..
+      " | Source sightings: " .. tostring(idb.db.meta.total_sources or 0) ..
+      " | Identify captures: " .. tostring(idb.db.meta.total_identifies or 0))
+   notify("Pending loot: " .. tostring(pending_source_count()) ..
+      " | Total loot sightings: " .. tostring(idb.db.meta.total_loot_sightings or 0))
+   notify("Database: " .. get_db_path())
+   notify("Summary : " .. get_summary_path())
+end
+
+local function show_help()
+   ColourNote("paleturquoise", "", "")
+   ColourNote("paleturquoise", "", "Aardwolf Item Database commands")
+   ColourNote("yellow", "", "  idb capture")
+   ColourNote("white", "", "    Run inventory serials and identify only recently looted items waiting in the pending list.")
+   ColourNote("yellow", "", "  idb capture all")
+   ColourNote("white", "", "    Run inventory serials and identify every item in your inventory.")
+   ColourNote("yellow", "", "  idb report")
+   ColourNote("white", "", "    Show database totals and file locations.")
+   ColourNote("yellow", "", "  idb reload")
+   ColourNote("white", "", "    Refresh the player name cache, backfill missing Added by values, and reload the plugin.")
+   ColourNote("yellow", "", "  idb <item name>")
+   ColourNote("white", "", "    Search by item name only and return unique base items. Click one to view all level variants.")
+   ColourNote("yellow", "", "  idb <item name> bloot")
+   ColourNote("white", "", "    Search by item name, but only for bonusloot variants.")
+   ColourNote("yellow", "", "  idb search <type/location> <min level> <max level>")
+   ColourNote("white", "", "    Search by item type or wearable location and level range.")
+   ColourNote("yellow", "", "  idb highest <stat> <type/location> <min level> <max level>")
+   ColourNote("white", "", "    Search by highest stat value within the requested type/location and level range.")
+   ColourNote("paleturquoise", "", "")
+end
+
+local function is_player_corpse_name(mob)
+   local player_name = normalize_item_name(get_player_name())
+   local mob_name = normalize_item_name(mob)
+   if player_name == "" or mob_name == "" then
+      return false
+   end
+
+   if mob_name == player_name then
+      return true
+   end
+
+   if mob_name:find(player_name, 1, true) then
+      return true
+   end
+
+   return false
+end
+
+function idb_track_item(name, line, wildcards)
+   local item_name = collapse_spaces(wildcards.item or "")
+   local mob = trim(wildcards.mob or "")
+   if item_name == "" or mob == "" then
+      return
+   end
+
+   if is_player_corpse_name(mob) then
+      return
+   end
+
+   add_loot_source(item_name, {
+      mob = mob,
+      area = get_current_area(),
+      looted_at = current_timestamp(),
+   })
+   schedule_db_save()
+end
+
+function idb_post_reload_notice()
+   local message = trim(GetVariable("reload_notice") or "")
+   if message ~= "" then
+      SetVariable("reload_notice", "")
+      notify(message)
+   end
+end
+
+local function do_reload()
+   refresh_player_name()
+   local did_backfill = backfill_missing_added_by()
+   save_db()
+   local message = "Reload complete. Player name cached as " .. (get_player_name() ~= "" and get_player_name() or "[unknown]") .. "."
+   if did_backfill then
+      message = message .. " Backfilled missing Added by values."
+   end
+   SetVariable("reload_notice", message)
+   ReloadPlugin(GetPluginID())
+end
+
+function idb_command(name, line, wildcards)
+   local args = trim((line or ""):gsub("^idb", "", 1))
+   local lowered = string.lower(args)
+
+   if args == "" or lowered == "help" then
+      show_help()
+      return
+   end
+
+   if lowered == "capture" then
+      start_capture(true)
+      return
+   end
+
+   if lowered == "capture all" then
+      start_capture(false)
+      return
+   end
+
+   if lowered == "report" then
+      show_report()
+      return
+   end
+
+   if lowered == "reload" then
+      notify("Refreshing player name cache and reloading plugin...")
+      do_reload()
+      return
+   end
+
+   local highest_stat, highest_type, highest_min, highest_max = args:match("^highest%s+(.+)%s+([^%s]+)%s+(%d+)%s+(%d+)$")
+   if highest_stat and highest_type and highest_min and highest_max then
+      show_highest_search_results(highest_stat, highest_type, tonumber(highest_min), tonumber(highest_max))
+      return
+   end
+
+   local search_type, min_level, max_level = args:match("^search%s+(.+)%s+(%d+)%s+(%d+)$")
+   if search_type and min_level and max_level then
+      show_stat_search_results(search_type, tonumber(min_level), tonumber(max_level))
+      return
+   end
+
+   local bloot_only = false
+   local item_query = args
+   if lowered:match("%s+bloot$") then
+      bloot_only = true
+      item_query = trim(args:gsub("%s+[Bb][Ll][Oo][Oo][Tt]$", ""))
+   end
+
+   if item_query == "" then
+      show_help()
+      return
+   end
+
+   show_grouped_name_results(item_query, bloot_only)
+end
+
+function OnPluginInstall()
+   idb.player_name = trim(GetVariable("player_name") or "")
+   local ok = load_db()
+   ensure_db()
+   refresh_player_name()
+   local did_backfill = backfill_missing_added_by()
+
+   if ok then
+      if did_backfill then
+         save_db(false)
+      end
+
+      local reload_notice = trim(GetVariable("reload_notice") or "")
+      if reload_notice ~= "" then
+         DoAfterSpecial(0, "idb_post_reload_notice()", sendto.script)
+      else
+         notify("Loaded item database from " .. get_db_path())
+      end
+   else
+      save_db()
+      notify("Created new item database at " .. get_db_path())
+   end
+end
+
+function OnPluginSaveState()
+   SetVariable("player_name", idb.player_name or "")
+   save_db()
+end
+
+function OnPluginDisable()
+   SetVariable("player_name", idb.player_name or "")
+   save_db()
+end
+
+function OnPluginClose()
+   SetVariable("player_name", idb.player_name or "")
+   save_db()
+end
+
+]]>
+</script>
+
+</muclient>
