@@ -1,0 +1,439 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+
+<plugin
+   name="Mobile_Command_Pad"
+   author="Dunnaakr"
+   id="3fa9c1e7b42d8a6f90ce51ab"
+   language="Lua"
+   purpose="Large clickable keypad mirror for mobile-friendly command use."
+   save_state="y"
+   date_written="2026-05-25 00:00:00"
+   requires="4.73"
+   version="2.0"
+   >
+<description trim="y">
+Large clickable button pad for mobile/remote play.
+Buttons mirror the world's keypad assignments for:
+0-9 . + - / *
+
+Commands:
+  commandpad          : Toggle the miniwindow.
+  commandpad show     : Show the miniwindow.
+  commandpad hide     : Hide the miniwindow.
+  commandpad reset    : Reset the miniwindow position.
+  commandpad refresh  : Reload keypad assignments from the world file.
+  commandpad nx stop  : Stop the auto-nx helper.
+</description>
+</plugin>
+
+<include name="constants.lua"/>
+
+<aliases>
+  <alias
+    match="^commandpad$"
+    regexp="y"
+    enabled="y"
+    send_to="12"
+    script="TogglePad"
+  ></alias>
+  <alias
+    match="^commandpad show$"
+    regexp="y"
+    enabled="y"
+    send_to="12"
+    script="ShowPad"
+  ></alias>
+  <alias
+    match="^commandpad hide$"
+    regexp="y"
+    enabled="y"
+    send_to="12"
+    script="HidePad"
+  ></alias>
+  <alias
+    match="^commandpad reset$"
+    regexp="y"
+    enabled="y"
+    send_to="12"
+    script="ResetPad"
+  ></alias>
+  <alias
+    match="^commandpad refresh$"
+    regexp="y"
+    enabled="y"
+    send_to="12"
+    script="RefreshPad"
+  ></alias>
+  </aliases>
+
+<script>
+<![CDATA[
+win = "mobile_command_pad_" .. GetPluginID()
+
+local keypad_order = {
+   "/", "*", "-",
+   "7", "8", "9",
+   "4", "5", "6",
+   "1", "2", "3",
+   "0", ".", "+",
+}
+
+local state = {
+   x = 40,
+   y = 120,
+   show = true,
+}
+
+local ui = {
+   header_h = 38,
+   pad = 10,
+   gap = 8,
+   button_h = 74,
+   button_w = 140,
+   width = 456,
+   height = 460,
+}
+
+local keypad_commands = {}
+
+local nx_helper = {
+   enabled = true,
+   delay_seconds = 0.60,
+   max_steps = 150,
+}
+
+local nx_state = {
+   active = false,
+   steps = 0,
+}
+
+local drag_state = {
+   active = false,
+   mouse_x = 0,
+   mouse_y = 0,
+   win_x = 0,
+   win_y = 0,
+}
+
+local function trim(value)
+   return (value or ""):match("^%s*(.-)%s*$")
+end
+
+local function save_state()
+   SetVariable("x", tostring(state.x))
+   SetVariable("y", tostring(state.y))
+   SetVariable("show", state.show and "y" or "n")
+end
+
+local function load_state()
+   state.x = tonumber(GetVariable("x")) or state.x
+   state.y = tonumber(GetVariable("y")) or state.y
+   state.show = GetVariable("show") ~= "n"
+end
+
+local function xml_unescape(text)
+   text = text or ""
+   text = text:gsub("&lt;", "<")
+   text = text:gsub("&gt;", ">")
+   text = text:gsub("&quot;", "\"")
+   text = text:gsub("&apos;", "'")
+   text = text:gsub("&amp;", "&")
+   return text
+end
+
+local function read_file(path)
+   local f = io.open(path, "r")
+   if not f then
+      return nil
+   end
+
+   local data = f:read("*a")
+   f:close()
+   return data
+end
+
+local function get_world_file_path()
+   local path = GetInfo(54) or ""
+   path = trim(path)
+
+   if path ~= "" then
+      return path
+   end
+
+   return ""
+end
+
+local function load_keypad_commands()
+   local commands = {}
+   local world_path = get_world_file_path()
+
+   for _, key in ipairs(keypad_order) do
+      commands[key] = ""
+   end
+
+   if world_path == "" then
+      keypad_commands = commands
+      return false
+   end
+
+   local content = read_file(world_path)
+   if not content then
+      keypad_commands = commands
+      return false
+   end
+
+   local keypad_block = content:match("<keypad.-</keypad>")
+   if not keypad_block then
+      keypad_commands = commands
+      return false
+   end
+
+   for key_name, send_text in keypad_block:gmatch('<key name="(.-)".->%s*<send>(.-)</send>%s*</key>') do
+      if commands[key_name] ~= nil then
+         commands[key_name] = trim(xml_unescape(send_text))
+      end
+   end
+
+   keypad_commands = commands
+   return true
+end
+
+local function get_button_geometry(index)
+   local col = ((index - 1) % 3)
+   local row = math.floor((index - 1) / 3)
+   local left = ui.pad + (col * (ui.button_w + ui.gap))
+   local top = ui.header_h + ui.pad + (row * (ui.button_h + ui.gap))
+   local right = left + ui.button_w
+   local bottom = top + ui.button_h
+   return left, top, right, bottom
+end
+
+local function get_button_command(key_name)
+   local command = keypad_commands[key_name] or ""
+   command = trim(command)
+   if command == "" then
+      return "(unassigned)"
+   end
+   return command
+end
+
+local function draw_button(index, key_name)
+   local left, top, right, bottom = get_button_geometry(index)
+   local fill = ColourNameToRGB("midnightblue")
+   local edge1 = ColourNameToRGB("deepskyblue")
+   local edge2 = ColourNameToRGB("white")
+   local key_colour = ColourNameToRGB("gold")
+   local cmd_colour = ColourNameToRGB("white")
+   local command = get_button_command(key_name)
+
+   WindowRectOp(win, miniwin.rect_fill, left, top, right, bottom, fill)
+   WindowRectOp(win, miniwin.rect_3d_rect, left, top, right, bottom, edge1, edge2)
+
+   WindowText(win, "key_font", key_name, left + 8, top + 6, 0, 0, key_colour)
+   WindowText(win, "cmd_font", command, left + 8, top + 28, right - 8, bottom - 8, cmd_colour)
+end
+
+local function add_hotspots()
+   WindowDeleteAllHotspots(win)
+
+   WindowAddHotspot(win, "drag_header", 0, 0, ui.width, ui.header_h, "", "", "", "", "", "Drag to move", miniwin.cursor_both_arrow, 0)
+   WindowDragHandler(win, "drag_header", "OnDragMove", "OnDragRelease", 0)
+
+   for i, key_name in ipairs(keypad_order) do
+      local left, top, right, bottom = get_button_geometry(i)
+      WindowAddHotspot(
+         win,
+         "btn_" .. tostring(i),
+         left,
+         top,
+         right,
+         bottom,
+         "",
+         "",
+         "OnButtonPress",
+         "",
+         "",
+         "Send keypad command: " .. get_button_command(key_name),
+         miniwin.cursor_hand,
+         0
+      )
+   end
+end
+
+function RedrawPad()
+   WindowRectOp(win, miniwin.rect_fill, 0, 0, 0, 0, ColourNameToRGB("black"))
+   WindowGradient(win, 0, 0, ui.width, ui.header_h, ColourNameToRGB("darkred"), ColourNameToRGB("black"), miniwin.gradient_horizontal)
+   WindowRectOp(win, miniwin.rect_3d_rect, 0, 0, ui.width, ui.height, ColourNameToRGB("gray"), ColourNameToRGB("white"))
+
+   WindowText(win, "title_font", "Mobile Keypad", 12, 9, 0, 0, ColourNameToRGB("white"))
+   WindowText(win, "sub_font", "Mirrors saved numpad assignments", 180, 11, 0, 0, ColourNameToRGB("silver"))
+
+   for i, key_name in ipairs(keypad_order) do
+      draw_button(i, key_name)
+   end
+
+   add_hotspots()
+   WindowShow(win, state.show)
+end
+
+local function create_window()
+   WindowCreate(win, 0, 0, ui.width, ui.height, miniwin.pos_stretch_to_view, miniwin.create_keep_hotspots, ColourNameToRGB("black"))
+   WindowFont(win, "title_font", "Verdana", 12, true, false, false, false, 0)
+   WindowFont(win, "sub_font", "Verdana", 8, false, false, false, false, 0)
+   WindowFont(win, "key_font", "Verdana", 12, true, false, false, false, 0)
+   WindowFont(win, "cmd_font", "Verdana", 10, true, false, false, false, 0)
+   WindowPosition(win, state.x, state.y, miniwin.pos_stretch_to_view, miniwin.create_absolute_location)
+   RedrawPad()
+end
+
+local function execute_real_nx()
+   EnableAlias("commandpad_nx_alias", false)
+   Execute("nx")
+   EnableAlias("commandpad_nx_alias", true)
+end
+
+local function stop_auto_nx(message)
+   nx_state.active = false
+   nx_state.steps = 0
+   EnableTimer("commandpad_nx_timer", false)
+
+   if message and message ~= "" then
+      ColourNote("cornflowerblue", "", "[CommandPad] " .. message)
+   end
+end
+
+local function start_auto_nx()
+   if not nx_helper.enabled then
+      execute_real_nx()
+      return
+   end
+
+   nx_state.active = true
+   nx_state.steps = 0
+   EnableTimer("commandpad_nx_timer", true)
+   execute_real_nx()
+end
+
+local function run_button_command(command)
+   command = trim(command)
+
+   if command == "" or command == "(unassigned)" then
+      ColourNote("white", "red", "[CommandPad] This keypad button is unassigned.")
+      return
+   end
+
+   if command:lower() == "nx" then
+      start_auto_nx()
+      return
+   end
+
+   Execute(command)
+end
+
+function OnButtonPress(flags, hotspot_id)
+   local index = tonumber((hotspot_id:gsub("^btn_", ""))) or 0
+   local key_name = keypad_order[index]
+
+   if key_name then
+      run_button_command(get_button_command(key_name))
+   end
+end
+
+function OnDragMove(flags, hotspot_id)
+   local mouse_x = WindowInfo(win, 17)
+   local mouse_y = WindowInfo(win, 18)
+
+   if not drag_state.active then
+      drag_state.active = true
+      drag_state.mouse_x = mouse_x
+      drag_state.mouse_y = mouse_y
+      drag_state.win_x = state.x
+      drag_state.win_y = state.y
+   end
+
+   state.x = drag_state.win_x + (mouse_x - drag_state.mouse_x)
+   state.y = drag_state.win_y + (mouse_y - drag_state.mouse_y)
+
+   WindowPosition(win, state.x, state.y, miniwin.pos_stretch_to_view, miniwin.create_absolute_location)
+end
+
+function OnDragRelease(flags, hotspot_id)
+   drag_state.active = false
+   save_state()
+end
+
+function TogglePad()
+   state.show = not state.show
+   save_state()
+   WindowShow(win, state.show)
+end
+
+function ShowPad()
+   state.show = true
+   save_state()
+   WindowShow(win, true)
+end
+
+function HidePad()
+   state.show = false
+   save_state()
+   WindowShow(win, false)
+end
+
+function ResetPad()
+   state.x = 40
+   state.y = 120
+   save_state()
+   WindowPosition(win, state.x, state.y, miniwin.pos_stretch_to_view, miniwin.create_absolute_location)
+   WindowShow(win, state.show)
+end
+
+function RefreshPad()
+   local ok = load_keypad_commands()
+   RedrawPad()
+
+   if ok then
+      ColourNote("cornflowerblue", "", "[CommandPad] Keypad assignments refreshed from the world file.")
+   else
+      ColourNote("white", "red", "[CommandPad] Could not read keypad assignments from the saved world file.")
+   end
+end
+
+-- ==============================================================
+-- BEGIN OPTIONAL NX HELPER
+-- Remove this section plus the nx alias/timer/trigger above if
+-- you ever want the keypad to send plain nx again.
+-- ==============================================================
+-- ==============================================================
+-- END OPTIONAL NX HELPER
+-- ==============================================================
+
+function OnPluginInstall()
+   load_state()
+   load_keypad_commands()
+   create_window()
+   ColourNote("cornflowerblue", "", "Mobile Command Pad v2 loaded. Type ", "white", "", "commandpad refresh", "cornflowerblue", "", " after changing keypad bindings.")
+end
+
+function OnPluginEnable()
+   WindowShow(win, state.show)
+end
+
+function OnPluginDisable()
+   WindowShow(win, false)
+   EnableTimer("commandpad_nx_timer", false)
+end
+
+function OnPluginSaveState()
+   save_state()
+end
+
+function OnPluginClose()
+   WindowDelete(win)
+end
+]]>
+</script>
+
+</muclient>
