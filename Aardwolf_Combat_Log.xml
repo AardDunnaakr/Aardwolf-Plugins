@@ -1,0 +1,704 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+
+<plugin
+   name="Aardwolf_Combat_Log"
+   author="Dunnaakr"
+   id="d56f0d61d6ec4c31a9d462a1"
+   language="Lua"
+   purpose="Captures combat and kill aftermath into a permanent miniwindow."
+   date_written="2026-05-06"
+   requires="5.07"
+   version="0.1"
+   save_state="y"
+>
+<description trim="y">
+<![CDATA[
+Permanent combat log window for Aardwolf.
+
+Behavior:
+  - Removes matched combat lines from the main output
+  - Sends combat lines to a dedicated miniwindow
+  - Captures damage, kill lines, exp, gold, loot, skillups,
+    and quest/campaign/global quest kill notices
+
+Commands:
+  combatlog              : Show help
+  combatlog show         : Show the combat log window
+  combatlog hide         : Hide the combat log window
+  combatlog clear        : Clear the combat log window
+  combatlog help         : Show help
+
+Shortcut:
+  clog <show|hide|clear|help>
+]]>
+</description>
+</plugin>
+
+<aliases>
+<alias
+   match="^combatlog(?: +(show|hide|clear|help))?$"
+   enabled="y"
+   regexp="y"
+   ignore_case="y"
+   sequence="100"
+   script="combatlog_alias"
+/>
+
+<alias
+   match="^clog(?: +(show|hide|clear|help))?$"
+   enabled="y"
+   regexp="y"
+   ignore_case="y"
+   sequence="100"
+   script="combatlog_alias"
+/>
+</aliases>
+
+<triggers>
+<trigger
+   enabled="y"
+   name="combat_damage"
+   match="^\*?(?:\[\d+\] )?(?:Your|(?:.*(?:'s|s))?) .+ \[\d+\]\*?$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_hidden_drop"
+   match="^You are no longer hidden\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_fade_in"
+   match="^You fade into existence\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_skillup"
+   match="^You have become better at .+! \(\d+%\)$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_loot_item"
+   match="^You get (?![\d,]+ gold coins)(.+) from the .*corpse of .+\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_exp"
+   match="^You(?: (?:don't))? receive [\d\+]+(?: 'rare kill')?(?: bonus)? experience (?:points?|bonus)(?: courtesy of .*| to celebrate .*| to rejoice in the death of another million mobs| in honor of .*| from your daily blessing)?[\.\!](?: \:\))?$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_daily_blessing_exp_remaining"
+   match="^You have \d+ daily blessing bonus experience kills remaining\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_daily_blessing_gold_remaining"
+   match="^You have \d+ daily blessing bonus gold kills? remaining\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_gold"
+   match="^You get [\d,]+ gold coins from .+\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_gold_daily"
+   match="^Your daily blessing added .* gold to the corpse\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_sacrifice"
+   match="^.* gives you \d+ gold coins? for .+\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_split"
+   match="^(?:You share .* gold coins with .* other .*\. Your share is .* gold\.|.* shares .* gold coins with .*\. Your share is .* gold\.)$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_crumble"
+   match="^Your .* crumbles to dust, but not before giving you .* gold coins?\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_quest_almost_done"
+   match="^QUEST: You have almost completed your QUEST!$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_quest_return"
+   match="^Return to the questmaster before your time runs out\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_campaign_kill"
+   match="^Congratulations, that was one of your CAMPAIGN mobs!$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_gq_kill"
+   match="^Congratulations, that was one of the GLOBAL QUEST mobs!$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_gq_remaining"
+   match="^You can be rewarded for .* more global quest kills? this level\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_gq_qp"
+   match="^3 quest points awarded\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_campaign_complete"
+   match="^CONGRATULATIONS! You have completed your campaign\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="combat_gq_complete"
+   match="^You have finished this global quest\.$"
+   regexp="y"
+   omit_from_output="y"
+   sequence="100"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_mind"
+   match="^(?P&lt;mob&gt;[\w ',]+) falls dead as \w+ mind is destroyed.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_drain"
+   match="^(?P&lt;mob&gt;[\w ',]+) howls as \w+ last spark of life is drained.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_pale"
+   match="^(?P&lt;mob&gt;[\w ',]+) turns deadly pale and collapses.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_acid"
+   match="^(?P&lt;mob&gt;[\w ',]+) screams in agony as the acid consumes .*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_holy"
+   match="^(?P&lt;mob&gt;[\w ',]+) is damned forever by the holy power.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_fire"
+   match="^(?P&lt;mob&gt;[\w ',]+) screams as the flames engulf .*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_water"
+   match="^(?P&lt;mob&gt;[\w ',]+) is battered to death by the force of the water.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_earth"
+   match="^(?P&lt;mob&gt;[\w ',]+) crumbles as \w+ is battered to death.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_lightning"
+   match="^(?P&lt;mob&gt;[\w ',]+) smoulders as the lightning destroys .*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_god"
+   match="^The voice of god has cleansed (?P&lt;mob&gt;.+) eternally.*DEAD.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_mindforce"
+   match="^The mind force crushes (?P&lt;mob&gt;.+) into a bloody pulp.*DEAD.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_desolate"
+   match="^(?P&lt;mob&gt;[\w ',]+) feels so desolate that life itself leaves \w+ wrecked form.*DEAD.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_fabric"
+   match="^The very fabric of the world rejects .+ life is over.*DEAD.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_letsout"
+   match="^(?P&lt;mob&gt;[\w ',]+) lets out .*DEAD.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="99"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_slain"
+   match="^(?P&lt;mob&gt;[\w ',]+) is slain by a final .*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="110"
+   script="combat_capture"
+/>
+
+<trigger
+   enabled="y"
+   name="death_mob_dead"
+   match="^(?P&lt;mob&gt;[\w ',]+).*DEAD.*[^']$"
+   regexp="y"
+   ignore_case="y"
+   omit_from_output="y"
+   sequence="120"
+   script="combat_capture"
+/>
+</triggers>
+
+<script>
+<![CDATA[
+require "themed_miniwindows"
+
+combat_log = {
+   window = nil,
+   visible = true,
+   active = false,
+   total_exp = 0,
+   total_gold = 0,
+   finalize_generation = 0,
+}
+
+local COMBAT_IDLE_SECONDS = 1.5
+
+local function buffered_repaint()
+   pcall(function()
+      CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+   end)
+end
+
+local function format_number(amount)
+   local text = tostring(math.floor(tonumber(amount) or 0))
+   local reversed = text:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+   return reversed:gsub("^,", "")
+end
+
+local function reset_session_totals()
+   combat_log.active = false
+   combat_log.total_exp = 0
+   combat_log.total_gold = 0
+end
+
+local function begin_session_if_needed()
+   if not combat_log.active then
+      combat_log.active = true
+      combat_log.total_exp = 0
+      combat_log.total_gold = 0
+   end
+end
+
+local function extract_exp(line)
+   if not line or not line:match("^You(?: don't)? receive .+ experience") then
+      return 0
+   end
+
+   local total = 0
+   for amount in line:gmatch("(%d+)") do
+      total = total + (tonumber(amount) or 0)
+   end
+   return total
+end
+
+local function extract_gold(line)
+   if not line then
+      return 0
+   end
+
+   local amount = line:match("^You get ([%d,]+) gold coins from .+%.$")
+      or line:match("^.* gives you ([%d,]+) gold coins? for .+%.$")
+      or line:match("^Your daily blessing added ([%d,]+) gold to the corpse%.$")
+      or line:match("^Your .* crumbles to dust, but not before giving you ([%d,]+) gold coins?%.$")
+      or line:match("Your share is ([%d,]+) gold%.$")
+
+   if not amount then
+      return 0
+   end
+
+   return tonumber((amount:gsub(",", ""))) or 0
+end
+
+local function bool_from_var(value, default)
+   if value == nil or value == "" then
+      return default
+   end
+   return value == "1"
+end
+
+local function ensure_window()
+   if combat_log.window and combat_log.window.id then
+      return combat_log.window
+   end
+
+   combat_log.window = ThemedTextWindow(
+      GetPluginID() .. "_combat_log",
+      80,
+      80,
+      900,
+      500,
+      nil,
+      nil,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      nil,
+      nil,
+      GetAlphaOption("output_font_name"),
+      GetOption("output_font_height"),
+      5000,
+      6,
+      true
+   )
+
+   if combat_log.visible then
+      combat_log.window:show()
+   end
+
+   buffered_repaint()
+   return combat_log.window
+end
+
+local function append_to_log(styles_or_text, line)
+   local win = ensure_window()
+
+   if type(styles_or_text) == "table" and #styles_or_text > 0 then
+      win:add_text(styles_or_text)
+   elseif type(styles_or_text) == "string" and styles_or_text ~= "" and line == nil then
+      win:add_text(styles_or_text)
+   else
+      win:add_text(line or "")
+   end
+
+   local bottom = math.max(1, (win.textrect.num_wrapped_lines or 1) - (win.textrect.rect_lines or 1) + 1)
+   win:set_scroll(bottom)
+
+   if combat_log.visible then
+      win:show()
+   end
+
+   buffered_repaint()
+end
+
+function combat_finalize_if_idle(generation)
+   if tonumber(generation) ~= combat_log.finalize_generation then
+      return
+   end
+
+   if not combat_log.active then
+      return
+   end
+
+   append_to_log(
+      string.format(
+         "@WCombat total: @G%s exp@W, @Y%s gold",
+         format_number(combat_log.total_exp),
+         format_number(combat_log.total_gold)
+      )
+   )
+   append_to_log("@w")
+   reset_session_totals()
+end
+
+function combat_capture(name, line, wildcards, styles)
+   begin_session_if_needed()
+   combat_log.total_exp = combat_log.total_exp + extract_exp(line)
+   combat_log.total_gold = combat_log.total_gold + extract_gold(line)
+   append_to_log(styles, line)
+   combat_log.finalize_generation = combat_log.finalize_generation + 1
+   DoAfterSpecial(
+      COMBAT_IDLE_SECONDS,
+      string.format("combat_finalize_if_idle(%d)", combat_log.finalize_generation),
+      12
+   )
+end
+
+local function combatlog_show()
+   combat_log.visible = true
+   ensure_window():show()
+   buffered_repaint()
+   ColourNote("paleturquoise", "", "Combat log window shown.")
+end
+
+local function combatlog_hide()
+   combat_log.visible = false
+   if combat_log.window and combat_log.window.id then
+      combat_log.window:hide()
+   end
+   buffered_repaint()
+   ColourNote("paleturquoise", "", "Combat log window hidden.")
+end
+
+local function combatlog_clear()
+   local win = ensure_window()
+   win:clear(false)
+   reset_session_totals()
+   combat_log.finalize_generation = combat_log.finalize_generation + 1
+   if combat_log.visible then
+      win:show()
+   end
+   buffered_repaint()
+   ColourNote("paleturquoise", "", "Combat log window cleared.")
+end
+
+local function combatlog_help()
+   ColourNote("lightgreen", "", "Combat log commands:")
+   ColourNote("white", "", "  combatlog show   - show the combat log window")
+   ColourNote("white", "", "  combatlog hide   - hide the combat log window")
+   ColourNote("white", "", "  combatlog clear  - clear the combat log window")
+   ColourNote("white", "", "  combatlog help   - show this help")
+end
+
+function combatlog_alias(name, line, wildcards)
+   local cmd = string.lower((wildcards[1] or "help"))
+
+   if cmd == "show" then
+      combatlog_show()
+   elseif cmd == "hide" then
+      combatlog_hide()
+   elseif cmd == "clear" then
+      combatlog_clear()
+   else
+      combatlog_help()
+   end
+end
+
+function OnPluginInstall()
+   combat_log.visible = bool_from_var(GetVariable("combatlog_visible"), true)
+   reset_session_totals()
+   ensure_window()
+end
+
+function OnPluginEnable()
+   combat_log.visible = bool_from_var(GetVariable("combatlog_visible"), true)
+   reset_session_totals()
+   ensure_window()
+   if combat_log.visible then
+      combat_log.window:show()
+   else
+      combat_log.window:hide()
+   end
+   buffered_repaint()
+end
+
+function OnPluginDisable()
+   if combat_log.window and combat_log.window.id then
+      combat_log.window:hide()
+   end
+end
+
+function OnPluginClose()
+   if combat_log.window and combat_log.window.id then
+      combat_log.window:delete()
+      combat_log.window = nil
+   end
+end
+
+function OnPluginSaveState()
+   SetVariable("combatlog_visible", combat_log.visible and "1" or "0")
+end
+]]>
+</script>
+
+</muclient>
