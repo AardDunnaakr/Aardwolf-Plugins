@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<!-- 
+  Auto Re-Dual Offhand after Portal (Any Weapon)
+  For Aardwolf MUD
+-->
+
+<muclient>
+
+  <plugin
+    name="AutoReDualOffhand"
+    author="Dunnaakr"
+    id="A7F3C9D14E8B62FA90CD5E17"
+    language="vbscript"
+    purpose="Automatically re-duals your current offhand weapon after portal (WOOSH)"
+    save_state="y">
+    <description trim="y">
+<![CDATA[
+Auto Re-Dual Offhand Plugin for Aardwolf
+
+Type "autodual" to toggle ON/OFF (default ON).
+Only triggers when off-hand is removed + WOOSH appears.
+]]>
+    </description>
+  </plugin>
+
+  <variables>
+    <variable name="OffhandWeapon"></variable>
+    <variable name="AutoDualEnabled">on</variable>
+  </variables>
+
+  <triggers>
+    <!-- Trigger 1: Capture offhand -->
+    <trigger
+      name="CaptureOffhandStop"
+      match="^You stop wielding .*?\((.+?)\) (.+?) in your off-hand\.$"
+      regexp="y"
+      enabled="y"
+      send_to="12"
+      sequence="100">
+      <send>
+<![CDATA[
+Dim fullName, shortName, words
+
+fullName = Trim("%2")
+If fullName = "" Then fullName = Trim("%1")
+
+words = Split(fullName, " ")
+shortName = Trim(words(UBound(words)))
+
+If shortName <> "" Then
+    world.SetVariable "OffhandWeapon", shortName
+    world.Note "Captured offhand: " & shortName
+End If
+]]>
+      </send>
+    </trigger>
+
+    <!-- Trigger 2: WOOSH → Re-dual (fixed) -->
+    <trigger
+      name="PortalWooshReDual"
+      match="^WHOOOOOOOOOOOOSH!$"
+      regexp="y"
+      enabled="y"
+      send_to="12"
+      sequence="100">
+      <send>
+<![CDATA[
+Dim enabled, weapon
+
+enabled = Trim(world.GetVariable("AutoDualEnabled"))
+If enabled = "on" Then
+    weapon = Trim(world.GetVariable("OffhandWeapon"))
+    If weapon <> "" Then
+        world.DoAfter 2, "dual " & weapon
+        world.Note "Re-dualing offhand in 2 seconds: " & weapon
+    End If
+End If
+]]>
+      </send>
+    </trigger>
+  </triggers>
+
+  <aliases>
+    <alias
+      name="ToggleAutoDual"
+      match="^autodual$"
+      enabled="y"
+      send_to="12">
+      <send>
+<![CDATA[
+Dim enabled
+enabled = Trim(world.GetVariable("AutoDualEnabled"))
+
+If enabled = "on" Then
+    world.SetVariable "AutoDualEnabled", "off"
+    world.Note "=== Auto Re-Dual OFF ==="
+Else
+    world.SetVariable "AutoDualEnabled", "on"
+    world.Note "=== Auto Re-Dual ON ==="
+End If
+]]>
+      </send>
+    </alias>
+  </aliases>
+
+</muclient>
