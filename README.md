@@ -1,2 +1,1 @@
-I enjoy making plugins and adding utility to our lives. If you have any requests, please reach out to me in game.
-Please include a list of demands.
+Playing and testing whatever I can for fun and learning. Let me know of any issues and I'll put up a patch. 
